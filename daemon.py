@@ -156,6 +156,10 @@ async def make_forge_callback(chat: ChatProcess):
             chat.session_id = new_sid
             save_state({"session_id": new_sid, "forge_history": history})
             await chat.interrupt()
+            await bot.send_message(
+                chat_id=TG_CHAT_ID,
+                text=f"🔄 上下文已滑动（{total_input:,} tokens），开了新 session，记忆库里的都还在。"
+            )
         except Exception as e:
             logging.error(f"forge-reload 失败: {e}")
     return on_result

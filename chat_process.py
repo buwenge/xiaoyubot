@@ -8,7 +8,7 @@ CLAUDE_CMD = [
     "--input-format",  "stream-json",
     "--output-format", "stream-json",
     "--include-partial-messages",
-    "--effort", "medium",
+    "--effort", "high",
     "--permission-mode", "bypassPermissions",
     "--model", "claude-opus-4-6",
     "--verbose",
@@ -118,7 +118,14 @@ class ChatProcess:
                     + usage.get("cache_creation_input_tokens", 0)
                     + usage.get("cache_read_input_tokens", 0)
                 )
-                logging.info(f"result: session={self.session_id} total_input={total_input}")
+                logging.info(
+                    f"result: session={self.session_id} "
+                    f"new={usage.get('input_tokens',0)} "
+                    f"cache_read={usage.get('cache_read_input_tokens',0)} "
+                    f"cache_write={usage.get('cache_creation_input_tokens',0)} "
+                    f"output={usage.get('output_tokens',0)} "
+                    f"total_input={total_input}"
+                )
 
                 if self._forge_callback and total_input > 0:
                     await self._forge_callback(total_input)
