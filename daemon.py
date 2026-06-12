@@ -274,6 +274,18 @@ async def main():
             f"forge 阈值：{FORGE_THRESHOLD:,}"
         )
 
+    async def handle_cost(update: Update, context):
+        if update.effective_chat.id != TG_CHAT_ID:
+            return
+        state = load_state()
+        session_cost = state.get("session_cost_usd", 0)
+        last = chat.last_cost_usd
+        await update.message.reply_text(
+            f"💰 本次会话累计：${session_cost:.4f}\n"
+            f"上一轮花费：${last:.4f}\n"
+            f"（Pro 订阅模式，实际额度消耗请去 claude.ai → Settings → Usage 查看）"
+        )
+
     # ── message processor ─────────────────────────────────────────────────────
 
     async def message_processor():
@@ -289,6 +301,14 @@ async def main():
                     save_state({"pending_notice": None})
             try:
                 result = await chat.send(text)
+
+                if chat.is_error:
+                    status = chat.error_status or "未知"
+                    msg = f"⚠️ Claude 报错（状态码 {status}）"
+                    if status in (429, "429"):
+                        msg = "⚠️ 触发限速或额度告急（429），建议去 claude.ai → Settings → Usage 查看剩余额度。"
+                    await _send_with_retry(bot, msg)
+
                 reply, nw = extract_next_wake(result["text"])
                 if nw:
                     set_next_wake(nw, user_set=True)
@@ -353,6 +373,7 @@ async def main():
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CommandHandler("forge", handle_forge))
     app.add_handler(CommandHandler("usage", handle_usage))
+    app.add_handler(CommandHandler("cost", handle_cost))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler(timezone=TZ)

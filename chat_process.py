@@ -27,6 +27,9 @@ class ChatProcess:
         self._response_complete = asyncio.Event()
         self._forge_callback = None
         self._current_usage = {}
+        self.last_cost_usd = 0.0
+        self.is_error = False
+        self.error_status = None
 
     def set_forge_callback(self, fn):
         self._forge_callback = fn
@@ -109,8 +112,22 @@ class ChatProcess:
 
             elif ev_type == "result":
                 self.session_id = ev.get("session_id", self.session_id)
-                self.save_state({"session_id": self.session_id})
                 self._current_usage = ev.get("usage", {})
+                self.last_cost_usd = ev.get("total_cost_usd", 0) or 0
+                self.is_error = ev.get("is_error", False)
+                self.error_status = ev.get("api_error_status")
+
+                # 累计 cost 并持久化
+                state = {}
+                try:
+                    import json as _json, pathlib as _pl
+                    _sf = _pl.Path(self.project_dir) / "state.json"
+                    state = _json.loads(_sf.read_text(encoding="utf-8")) if _sf.exists() else {}
+                except Exception:
+                    pass
+                state["session_id"] = self.session_id
+                state["session_cost_usd"] = state.get("session_cost_usd", 0) + self.last_cost_usd
+                self.save_state(state)
 
                 usage = self._current_usage
                 total_input = (
@@ -124,7 +141,8 @@ class ChatProcess:
                     f"cache_read={usage.get('cache_read_input_tokens',0)} "
                     f"cache_write={usage.get('cache_creation_input_tokens',0)} "
                     f"output={usage.get('output_tokens',0)} "
-                    f"total_input={total_input}"
+                    f"total_input={total_input} "
+                    f"cost=${self.last_cost_usd:.4f} is_error={self.is_error}"
                 )
 
                 if self._forge_callback and total_input > 0:
