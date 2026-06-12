@@ -171,20 +171,39 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-async def send_reply(bot: Bot, text: str, thinking: str = ""):
+async def _send_with_retry(bot: Bot, text: str, retries: int = 3) -> bool:
+    """发送单条消息，失败重试，返回是否成功"""
+    for attempt in range(retries):
+        try:
+            await bot.send_message(chat_id=TG_CHAT_ID, text=text)
+            return True
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+            else:
+                logging.error(f"消息发送失败（{retries}次重试后放弃）: {e}")
+    return False
+
+
+async def send_reply(bot: Bot, text: str, thinking: str = "") -> bool:
+    """发送回复，返回是否成功"""
     if thinking:
         preview = thinking[:2000] + ("…" if len(thinking) > 2000 else "")
-        await bot.send_message(chat_id=TG_CHAT_ID, text=f"💭 思维链\n\n{preview}")
+        await _send_with_retry(bot, f"💭 思维链\n\n{preview}")
 
     if not text:
-        return
+        return True
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         parts = [text]
+    success = True
     for i, part in enumerate(parts):
-        await bot.send_message(chat_id=TG_CHAT_ID, text=part)
+        ok = await _send_with_retry(bot, part)
+        if not ok:
+            success = False
         if i < len(parts) - 1:
             await asyncio.sleep(1)
+    return success
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -261,6 +280,13 @@ async def main():
         while True:
             text = await message_queue.get()
             save_state({"last_chat_time": now_local().isoformat()})
+
+            # 补发之前因网络问题没发出的通知
+            state = load_state()
+            if state.get("pending_notice"):
+                ok = await _send_with_retry(bot, state["pending_notice"])
+                if ok:
+                    save_state({"pending_notice": None})
             try:
                 result = await chat.send(text)
                 reply, nw = extract_next_wake(result["text"])
@@ -302,7 +328,12 @@ async def main():
             parsed = parse_wakeup_reply(result["text"])
 
             if parsed["action"] == "message" and parsed["content"]:
-                await send_reply(bot, parsed["content"], thinking=result["thinking"])
+                ok = await send_reply(bot, parsed["content"], thinking=result["thinking"])
+                if not ok:
+                    # 记录发送失败，下次网络恢复时补通知
+                    state = load_state()
+                    state["pending_notice"] = f"网络波动了，刚才 {now_local().strftime('%H:%M')} 想找你，但消息没发出去。"
+                    save_state(state)
 
             set_next_wake(parsed["next_minutes"])
         except Exception as e:
