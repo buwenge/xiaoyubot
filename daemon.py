@@ -154,7 +154,7 @@ async def make_forge_callback(chat: ChatProcess):
             history = state.get("forge_history", {})
             history[chat.session_id] = new_sid
             chat.session_id = new_sid
-            save_state({"session_id": new_sid, "forge_history": history})
+            save_state({"session_id": new_sid, "forge_history": history, "is_new_session": True})
             await chat.interrupt()
             await bot.send_message(
                 chat_id=TG_CHAT_ID,
@@ -214,6 +214,9 @@ async def main():
     chat = ChatProcess(project_dir=PROJECT_DIR, save_state_fn=save_state)
     if state.get("session_id"):
         chat.session_id = state["session_id"]
+    else:
+        # 全新 session，标记让第一条消息带上 [NEW_SESSION]
+        save_state({"is_new_session": True})
 
     forge_cb = await make_forge_callback(chat)
     chat.set_forge_callback(forge_cb)
@@ -250,7 +253,7 @@ async def main():
             history = state.get("forge_history", {})
             history[chat.session_id] = new_sid
             chat.session_id = new_sid
-            save_state({"session_id": new_sid, "forge_history": history})
+            save_state({"session_id": new_sid, "forge_history": history, "is_new_session": True})
             await chat.interrupt()
             await update.message.reply_text(f"forge 完成，新 session: {new_sid[:8]}…")
         except Exception as e:
@@ -300,6 +303,10 @@ async def main():
                 if ok:
                     save_state({"pending_notice": None})
             try:
+                state = load_state()
+                if state.get("is_new_session"):
+                    text = f"[NEW_SESSION]\n{text}"
+                    save_state({"is_new_session": False})
                 result = await chat.send(text)
 
                 if chat.is_error:
@@ -337,7 +344,13 @@ async def main():
         now_str = now_local().strftime("%Y-%m-%d %H:%M")
         silence = silence_desc()
 
+        state = load_state()
+        new_session_tag = "[NEW_SESSION]\n" if state.get("is_new_session") else ""
+        if new_session_tag:
+            save_state({"is_new_session": False})
+
         wakeup_msg = (
+            f"{new_session_tag}"
             f"[WAKEUP]\n"
             f"现在是 {now_str}，距离上次聊天已经过去了 {silence}。\n"
             f"这是你的自由时间。请按照 CLAUDE.md 中的唤醒行为规则回复。"
