@@ -142,7 +142,7 @@ def extract_next_wake(text: str) -> tuple[str, int | None]:
 
 # ── forge callback ────────────────────────────────────────────────────────────
 
-async def make_forge_callback(chat: ChatProcess):
+async def make_forge_callback(chat: ChatProcess, bot: Bot):
     async def on_result(total_input: int):
         if total_input < FORGE_THRESHOLD:
             return
@@ -211,6 +211,8 @@ async def send_reply(bot: Bot, text: str, thinking: str = "") -> bool:
 async def main():
     state = load_state()
 
+    bot = Bot(token=TG_BOT_TOKEN)
+
     chat = ChatProcess(project_dir=PROJECT_DIR, save_state_fn=save_state)
     if state.get("session_id"):
         chat.session_id = state["session_id"]
@@ -218,10 +220,8 @@ async def main():
         # 全新 session，标记让第一条消息带上 [NEW_SESSION]
         save_state({"is_new_session": True})
 
-    forge_cb = await make_forge_callback(chat)
+    forge_cb = await make_forge_callback(chat, bot)
     chat.set_forge_callback(forge_cb)
-
-    bot = Bot(token=TG_BOT_TOKEN)
     message_queue: asyncio.Queue = asyncio.Queue()
 
     # ── handlers ──────────────────────────────────────────────────────────────
