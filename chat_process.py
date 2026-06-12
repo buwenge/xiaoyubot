@@ -2,16 +2,15 @@ import asyncio
 import json
 import logging
 import time
-import pathlib
 
 CLAUDE_CMD = [
     "claude",
     "--input-format",  "stream-json",
     "--output-format", "stream-json",
     "--include-partial-messages",
-    "--thinking-display", "summarized",
+    "--effort", "medium",
     "--permission-mode", "bypassPermissions",
-    "--model", "claude-sonnet-4-6",
+    "--model", "claude-opus-4-6",
     "--verbose",
 ]
 
@@ -24,8 +23,9 @@ class ChatProcess:
         self.session_id = None
         self.last_activity = time.time()
         self._response_buffer = ""
+        self._thinking_buffer = ""
         self._response_complete = asyncio.Event()
-        self._forge_callback = None  # set by daemon after init
+        self._forge_callback = None
         self._current_usage = {}
 
     def set_forge_callback(self, fn):
@@ -47,11 +47,13 @@ class ChatProcess:
         asyncio.create_task(self._pump_stderr())
         logging.info(f"Claude Code 子进程已启动 (resume={resume_sid})")
 
-    async def send(self, text: str) -> str:
+    async def send(self, text: str) -> dict:
+        """发送消息，返回 {"text": str, "thinking": str}"""
         if not self.proc or self.proc.returncode is not None:
             await self.spawn(resume_sid=self.session_id)
 
         self._response_buffer = ""
+        self._thinking_buffer = ""
         self._response_complete.clear()
         self.last_activity = time.time()
 
@@ -70,7 +72,7 @@ class ChatProcess:
         except asyncio.TimeoutError:
             logging.warning("Claude Code 回复超时（300s）")
 
-        return self._response_buffer
+        return {"text": self._response_buffer, "thinking": self._thinking_buffer}
 
     async def _pump_stdout(self):
         async for raw_line in self.proc.stdout:
@@ -83,23 +85,27 @@ class ChatProcess:
                 continue
 
             ev_type = ev.get("type", "")
-            logging.info(f"[CC event] type={ev_type} keys={list(ev.keys())}")
 
-            if ev_type == "assistant":
-                # CC stream-json 格式：assistant 事件含完整/部分 message
+            if ev_type == "system" and ev.get("subtype") == "init":
+                logging.info(f"[CC init] model={ev.get('model')} session={ev.get('session_id')}")
+
+            elif ev_type == "assistant":
                 msg = ev.get("message", {})
                 content = msg.get("content", [])
                 if isinstance(content, list):
-                    texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                    texts = []
+                    thinking = []
+                    for b in content:
+                        if b.get("type") == "text":
+                            texts.append(b.get("text", ""))
+                        elif b.get("type") == "thinking":
+                            thinking.append(b.get("thinking", b.get("text", "")))
+                        elif b.get("type") == "tool_use":
+                            logging.info(f"[CC tool] {b.get('name')} input={json.dumps(b.get('input', {}), ensure_ascii=False)[:200]}")
                     if texts:
                         self._response_buffer = "".join(texts)
-
-            elif ev_type == "content_block_delta":
-                delta = ev.get("delta", {})
-                logging.info(f"[CC delta] {delta}")
-                text = delta.get("text", "")
-                if text:
-                    self._response_buffer += text
+                    if thinking:
+                        self._thinking_buffer = "\n\n".join(thinking)
 
             elif ev_type == "result":
                 self.session_id = ev.get("session_id", self.session_id)

@@ -163,7 +163,15 @@ async def make_forge_callback(chat: ChatProcess):
 
 # ── telegram helpers ──────────────────────────────────────────────────────────
 
-async def send_reply(bot: Bot, text: str):
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def send_reply(bot: Bot, text: str, thinking: str = ""):
+    if thinking:
+        preview = thinking[:2000] + ("…" if len(thinking) > 2000 else "")
+        await bot.send_message(chat_id=TG_CHAT_ID, text=f"💭 思维链\n\n{preview}")
+
     if not text:
         return
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -250,11 +258,11 @@ async def main():
             text = await message_queue.get()
             save_state({"last_chat_time": now_local().isoformat()})
             try:
-                reply = await chat.send(text)
-                reply, nw = extract_next_wake(reply)
+                result = await chat.send(text)
+                reply, nw = extract_next_wake(result["text"])
                 if nw:
                     set_next_wake(nw, user_set=True)
-                await send_reply(bot, reply)
+                await send_reply(bot, reply, thinking=result["thinking"])
             except Exception as e:
                 logging.error(f"消息处理失败: {e}")
                 await bot.send_message(chat_id=TG_CHAT_ID, text="（出了点问题，请稍后再试）")
@@ -286,11 +294,11 @@ async def main():
         )
 
         try:
-            reply = await chat.send(wakeup_msg)
-            parsed = parse_wakeup_reply(reply)
+            result = await chat.send(wakeup_msg)
+            parsed = parse_wakeup_reply(result["text"])
 
             if parsed["action"] == "message" and parsed["content"]:
-                await send_reply(bot, parsed["content"])
+                await send_reply(bot, parsed["content"], thinking=result["thinking"])
 
             set_next_wake(parsed["next_minutes"])
         except Exception as e:
