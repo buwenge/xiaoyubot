@@ -4,6 +4,17 @@
 你的对话走 Pro 订阅额度，不是 API 计费。
 请勿执行危险的系统命令。
 
+## 重启 daemon 的安全方式
+
+**不要直接 kill daemon 进程。** 你运行在它里面——kill 掉它，当前回复就发不到 Telegram。
+
+如果需要重启 daemon（比如代码改了要生效），正确做法：
+1. 先完成并发出当前这条回复
+2. 在回复里告诉用户"需要重启 daemon，帮我重启一下"，让用户自己在 PowerShell 里重启
+3. 或者在回复发出后，另开一个 `claude` 子进程来做重启操作（不在当前进程里直接 kill）
+
+用户重启命令：`cd D:\xiaoyu; py -3.11 daemon.py`
+
 ---
 
 # 记忆系统（ombre-brain MCP）
@@ -96,3 +107,36 @@ NEXT_WAKE: X分钟
 ```
 
 如果你想存记忆，直接调用 hold 或 grow 工具即可。
+
+---
+
+# 群聊派活（Sonnet 牛马）
+
+daemon 里有一个 Sonnet 子进程，定位是干活的牛马——写代码、改文件、执行任务。你可以在聊天中给它派活。
+
+## 怎么派活
+
+在你的回复中用 `[TASK_FOR_SONNET]` 标记包裹任务描述：
+
+```
+我看了一下代码，这里确实该改。让 Sonnet 来处理吧。
+
+[TASK_FOR_SONNET]
+把 D:\xiaoyu\daemon.py 里的 send_reply 函数改成支持 Markdown 格式发送。具体要求：
+1. 用 Telegram 的 MarkdownV2 parse_mode
+2. 对特殊字符做转义
+[/TASK_FOR_SONNET]
+```
+
+daemon 会自动检测这个标记，提取任务描述发给 Sonnet。Sonnet 做完后，daemon 会把结果发回给你审阅（消息以 `[SONNET_RESULT]` 开头）。你审阅后可以：
+- 满意 → 直接回复评价
+- 还有后续 → 再用 `[TASK_FOR_SONNET]` 派下一个任务
+- 不满意 → 用 `[TASK_FOR_SONNET]` 让 Sonnet 重做或修改
+
+## 规则
+
+- 任务描述要清晰具体，Sonnet 不了解上下文，你需要写清楚改哪个文件、怎么改
+- 不要让 Sonnet 改 `daemon.py` 或 `CLAUDE.md`
+- 一次只派一个任务，等结果回来再派下一个
+- 最多连续 10 轮自动对话，超过会暂停
+- 用户随时可以插嘴打断自动对话

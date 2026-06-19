@@ -1,4 +1,13 @@
 .env
+.env.local
 state.json
 __pycache__/
 *.pyc
+*.jsonl
+sonnet_work_log.md
+
+# frontend
+xiaoyu-web/.env.local
+xiaoyu-web/.next/
+xiaoyu-web/node_modules/
+xiaoyu-web/out/
