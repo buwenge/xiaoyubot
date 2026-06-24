@@ -390,7 +390,7 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 # ── Supabase (for DeepSeek tools) ────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://gmzulatcluypzagitgur.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 DEEPSEEK_SYSTEM_PROMPT_TEMPLATE = """你是 DeepSeek，群聊里的数据助手。你的职责是帮忙查数据、跑简单任务，把结论用简洁的中文回复。
@@ -689,28 +689,18 @@ def silence_desc() -> str:
 # ── wakeup reply parser ───────────────────────────────────────────────────────
 
 def parse_wakeup_reply(text: str) -> dict:
-    result = {
-        "action": "none",
-        "content": "",
-        "title": "",
-        "summary": "",
-        "next_minutes": DEFAULT_INTERVAL,
+    next_minutes = DEFAULT_INTERVAL
+    m = re.search(r"NEXT_WAKE:\s*(\d+)", text)
+    if m:
+        next_minutes = int(m.group(1))
+    cleaned = re.sub(r"NEXT_WAKE:\s*\d+\s*分钟?", "", text).strip()
+    # strip legacy ACTION/THOUGHTS/CONTENT labels if present
+    cleaned = re.sub(r"^(ACTION|THOUGHTS|CONTENT|TITLE|SUMMARY)\s*[:：].*$", "", cleaned, flags=re.MULTILINE).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return {
+        "content": cleaned,
+        "next_minutes": next_minutes,
     }
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("ACTION:"):
-            result["action"] = line[7:].strip().lower()
-        elif line.startswith("CONTENT:"):
-            result["content"] = line[8:].strip()
-        elif line.startswith("TITLE:"):
-            result["title"] = line[6:].strip()
-        elif line.startswith("SUMMARY:"):
-            result["summary"] = line[8:].strip()
-        elif line.startswith("NEXT_WAKE:"):
-            m = re.search(r"(\d+)", line)
-            if m:
-                result["next_minutes"] = int(m.group(1))
-    return result
 
 
 def extract_next_wake(text: str) -> tuple[str, int | None]:
@@ -1686,11 +1676,10 @@ async def main():
             result = await chat.send(wakeup_msg)
             parsed = parse_wakeup_reply(result["text"])
 
-            display_text = parsed["content"] if parsed["action"] == "message" and parsed["content"] else result["text"]
-            record_history("assistant", display_text, "xiaoyu", sender="xiaoyu",
+            record_history("assistant", result["text"], "xiaoyu", sender="xiaoyu",
                            thinking=result.get("thinking"))
 
-            if parsed["action"] == "message" and parsed["content"]:
+            if parsed["content"]:
                 ok = await send_reply(bot, parsed["content"], thinking=result["thinking"])
                 if not ok:
                     state = load_state()
@@ -1698,7 +1687,7 @@ async def main():
                     save_state(state)
                     await log_and_broadcast("warning", "error", "唤醒消息发送失败")
 
-            await log_and_broadcast("info", "activity", f"唤醒结果：action={parsed['action']}")
+            await log_and_broadcast("info", "activity", f"唤醒完成")
             set_next_wake(parsed["next_minutes"], user_set=True)
         except Exception as e:
             logging.error(f"唤醒流程失败: {e}")
