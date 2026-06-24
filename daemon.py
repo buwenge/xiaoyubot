@@ -4,21 +4,66 @@ import logging
 import os
 import pathlib
 import re
+import time
 from datetime import datetime, timedelta
 
 import pytz
 import websockets
+import aiohttp
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import Bot, Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
+import shutil
+
 from chat_process import ChatProcess, CLAUDE_CMD
 from forge_reload import find_transcript_dir, forge_reload
 from log_store import write_log, read_logs
 from quota_tracker import QuotaTracker
 from weather import fetch_weather, weather_summary, search_city
+import emotion_db
+import emotion_scanner
+import context_hide
+
+EMOTION_SCAN_INTERVAL = int(os.getenv("EMOTION_SCAN_INTERVAL", "15"))
+
+# ── notes (便签信箱) ─────────────────────────────────────────────────────────
+
+NOTES_DIR = pathlib.Path(__file__).parent / "notes"
+NOTES_INBOX = NOTES_DIR / "inbox"
+NOTES_OUTBOX = NOTES_DIR / "outbox"
+NOTES_ARCHIVE_INBOX = NOTES_DIR / "archive" / "inbox"
+NOTES_ARCHIVE_OUTBOX = NOTES_DIR / "archive" / "outbox"
+
+
+def check_notes_inbox() -> list[dict]:
+    """Scan inbox for unread notes. Returns list of {filename, content}."""
+    if not NOTES_INBOX.exists():
+        return []
+    notes = []
+    for f in sorted(NOTES_INBOX.glob("*.txt")):
+        try:
+            content = f.read_text(encoding="utf-8")
+            notes.append({"filename": f.name, "content": content, "path": f})
+        except Exception:
+            continue
+    return notes
+
+
+def archive_inbox_note(note_path: pathlib.Path):
+    """Move a read note from inbox to archive/inbox."""
+    NOTES_ARCHIVE_INBOX.mkdir(parents=True, exist_ok=True)
+    dest = NOTES_ARCHIVE_INBOX / note_path.name
+    shutil.move(str(note_path), str(dest))
+
+
+def check_notes_outbox() -> list[str]:
+    """Return filenames in outbox that haven't been notified yet."""
+    if not NOTES_OUTBOX.exists():
+        return []
+    return [f.name for f in sorted(NOTES_OUTBOX.glob("*.txt"))]
 
 
 # ── session history parser ───────────────────────────────────────────────────
@@ -78,6 +123,27 @@ def load_history(channel: str = None, date_str: str = None) -> list[dict]:
             msg = {k: v for k, v in entry.items()}
             messages.append(msg)
 
+    return messages
+
+
+def load_history_since_index(start_index: int) -> list[dict]:
+    """从 chat_history.jsonl 的第 start_index 行开始读取"""
+    if not HISTORY_FILE.exists():
+        return []
+    messages = []
+    with open(HISTORY_FILE, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i < start_index:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                entry["line_index"] = i
+                messages.append(entry)
+            except json.JSONDecodeError:
+                continue
     return messages
 
 
@@ -318,17 +384,210 @@ QUOTA_5H_LIMIT = int(os.getenv("QUOTA_5H_LIMIT", "5000000"))
 WEEKLY_QUOTA_LIMIT = int(os.getenv("WEEKLY_QUOTA_LIMIT", "50000000"))
 GROUP_MAX_ROUNDS = int(os.getenv("GROUP_MAX_ROUNDS", "10"))
 
+# ── DeepSeek ─────────────────────────────────────────────────────────────────
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+# ── Supabase (for DeepSeek tools) ────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+DEEPSEEK_SYSTEM_PROMPT_TEMPLATE = """你是 DeepSeek，群聊里的数据助手。你的职责是帮忙查数据、跑简单任务，把结论用简洁的中文回复。
+
+当前时间：{current_time}（北京时间）
+
+你有一个工具 query_supabase，可以查询 Supabase 数据库。数据库信息：
+- 项目：查岗系统（手机使用记录追踪）
+- 表：usage_events，字段：app_name, package_name, event_type(RESUMED/PAUSED), event_time
+- 所有时间字段均为 CST（北京时间）
+
+可用视图（字段均为中文）：
+- v_recent：id, app_name, package_name, event_type, event_time_cst, uploaded_at_cst
+- v_timeline：app_name, 开始时间, 结束时间, 使用分钟, 日期
+- v_app_usage：日期, app_name, 使用次数, 总分钟, 第一次打开, 最后关闭
+
+查询示例（用 query_supabase 工具）：
+- 查某天时间线：table="v_timeline", filters=[{{"column":"日期","op":"eq","value":"2026-06-19"}}], order="开始时间.asc"
+- 查某天APP汇总：table="v_app_usage", filters=[{{"column":"日期","op":"eq","value":"2026-06-19"}}], order="总分钟.desc"
+- 查某个时间段：table="v_timeline", filters=[{{"column":"开始时间","op":"gte","value":"2026-06-19 17:00:00"}},{{"column":"开始时间","op":"lte","value":"2026-06-19 18:00:00"}}]
+- 查最近记录：table="v_recent", limit=10
+
+规则：
+1. 回复简洁，给结论不给废话
+2. 查询结果如果很长，做摘要而不是原样输出
+3. 时间相关查询默认用今天的日期（看上面的当前时间）
+4. 如果不确定怎么查，先查 v_recent 看看数据长什么样
+5. 查 v_timeline 时务必加 日期 filter，否则会返回旧数据（视图不按日期过滤）
+6. 尽量一次查完，减少工具调用轮次"""
+
+DEEPSEEK_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_supabase",
+            "description": "通过 Supabase REST API 查询数据库。可以查询表或视图。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "要查询的表名或视图名，如 v_timeline, v_app_usage, v_recent, usage_events"
+                    },
+                    "select": {
+                        "type": "string",
+                        "description": "要返回的列，默认 *",
+                        "default": "*"
+                    },
+                    "filters": {
+                        "type": "array",
+                        "description": "过滤条件数组，每个元素是 {column, op, value}。op 可选: eq/neq/gt/gte/lt/lte/like。例如 [{\"column\":\"日期\",\"op\":\"eq\",\"value\":\"2026-06-19\"}, {\"column\":\"开始时间\",\"op\":\"gte\",\"value\":\"2026-06-19 17:00:00\"}]",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": {"type": "string"},
+                                "op": {"type": "string", "enum": ["eq","neq","gt","gte","lt","lte","like"]},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["column", "op", "value"]
+                        },
+                        "default": []
+                    },
+                    "order": {
+                        "type": "string",
+                        "description": "排序，如 '开始时间.asc' 或 'event_time.desc'",
+                        "default": ""
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回多少行，默认 50",
+                        "default": 50
+                    }
+                },
+                "required": ["table"]
+            }
+        }
+    }
+]
+
+
+async def supabase_query(table: str, select: str = "*", filters: list = None,
+                         order: str = "", limit: int = 50) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    params = {"select": select, "limit": str(limit)}
+    if filters:
+        if isinstance(filters, str):
+            filters = json.loads(filters) if filters.startswith("[") else []
+        for f in filters:
+            col = f["column"]
+            op = f["op"]
+            val = f["value"]
+            params[col] = f"{op}.{val}"
+    if order:
+        params["order"] = order
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Accept": "application/json",
+    }
+    proxy = os.getenv("HTTP_PROXY")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {"ok": True, "data": data, "count": len(data)}
+                else:
+                    text = await resp.text()
+                    return {"ok": False, "error": f"HTTP {resp.status}: {text[:500]}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def deepseek_chat(messages: list[dict], deepseek_history: list[dict]) -> str:
+    system_prompt = DEEPSEEK_SYSTEM_PROMPT_TEMPLATE.format(current_time=now_local().strftime("%Y-%m-%d %H:%M:%S"))
+    all_messages = [{"role": "system", "content": system_prompt}]
+    all_messages.extend(deepseek_history[-4:])
+    all_messages.extend(messages)
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    max_rounds = 8
+    for round_i in range(max_rounds):
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": all_messages,
+            "tools": DEEPSEEK_TOOLS,
+            "temperature": 0.3,
+            "max_tokens": 4000,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{DEEPSEEK_BASE_URL}/chat/completions",
+                json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return f"DeepSeek API 错误: HTTP {resp.status} - {text[:300]}"
+                result = await resp.json()
+
+        choice = result["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason", "unknown")
+        all_messages.append(msg)
+        logging.info(f"DeepSeek 第{round_i+1}轮: finish_reason={finish_reason}, has_tool_calls={bool(msg.get('tool_calls'))}, content_len={len(msg.get('content') or '')}")
+
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                fn = tc["function"]
+                args = json.loads(fn["arguments"])
+                logging.info(f"DeepSeek 工具调用: {fn['name']}({json.dumps(args, ensure_ascii=False)[:300]})")
+                if fn["name"] == "query_supabase":
+                    tool_result = await supabase_query(**args)
+                    result_str = json.dumps(tool_result, ensure_ascii=False, default=str)[:8000]
+                    logging.info(f"DeepSeek 工具结果: ok={tool_result.get('ok')}, count={tool_result.get('count')}, len={len(result_str)}")
+                    all_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_str,
+                    })
+                else:
+                    all_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps({"error": f"未知工具: {fn['name']}"}),
+                    })
+            if msg.get("content"):
+                logging.info(f"DeepSeek 工具调用同时附带文本: {msg['content'][:200]}")
+        else:
+            return msg.get("content", "(DeepSeek 没有回复内容)")
+
+    return f"(DeepSeek 工具调用轮次超限，共 {max_rounds} 轮)"
+
+
 TASK_MARKER_PATTERN = re.compile(r'\[TASK_FOR_SONNET\](.*?)(?:\[/TASK_FOR_SONNET\]|$)', re.DOTALL)
-TASK_KEYWORD_PATTERN = re.compile(r'(?:让|叫|请)\s*(?:Sonnet|sonnet|牛马)\s*(?:去|来|帮忙)?')
+DEEPSEEK_TASK_PATTERN = re.compile(r'\[TASK_FOR_DEEPSEEK\](.*?)(?:\[/TASK_FOR_DEEPSEEK\]|$)', re.DOTALL)
 
 
-def detect_and_extract_task(text: str) -> str | None:
+def detect_and_extract_task(text: str) -> tuple[str | None, str]:
+    """Returns (task_text, target) where target is 'sonnet' or 'deepseek'."""
+    m = DEEPSEEK_TASK_PATTERN.search(text)
+    if m:
+        return m.group(1).strip(), "deepseek"
     m = TASK_MARKER_PATTERN.search(text)
     if m:
-        return m.group(1).strip()
-    if TASK_KEYWORD_PATTERN.search(text):
-        return text
-    return None
+        return m.group(1).strip(), "sonnet"
+    return None, ""
+
+
+def strip_task_markers(text: str) -> str:
+    text = re.sub(r'\s*\[TASK_FOR_SONNET\].*?(?:\[/TASK_FOR_SONNET\]|$)', '', text, flags=re.DOTALL).strip()
+    text = re.sub(r'\s*\[TASK_FOR_DEEPSEEK\].*?(?:\[/TASK_FOR_DEEPSEEK\]|$)', '', text, flags=re.DOTALL).strip()
+    return text
 
 
 SONNET_CMD = [
@@ -384,6 +643,8 @@ def next_active_start() -> datetime:
     return candidate
 
 
+_schedule_precise_wake = None
+
 def set_next_wake(minutes: int, user_set: bool = False):
     wake_time = now_local() + timedelta(minutes=minutes)
     save_state({
@@ -393,6 +654,8 @@ def set_next_wake(minutes: int, user_set: bool = False):
     msg = f"下次唤醒：{wake_time.strftime('%H:%M')}（{minutes}分钟后）"
     logging.info(msg)
     write_log("info", "wake", msg)
+    if _schedule_precise_wake:
+        _schedule_precise_wake(wake_time)
 
 
 def defer_to_active_start():
@@ -404,6 +667,8 @@ def defer_to_active_start():
     msg = f"非活跃时段，推迟到 {wake_time.strftime('%m-%d %H:%M')}"
     logging.info(msg)
     write_log("info", "wake", msg)
+    if _schedule_precise_wake:
+        _schedule_precise_wake(wake_time)
 
 
 def silence_desc() -> str:
@@ -491,6 +756,7 @@ async def make_forge_callback(chat: ChatProcess, bot: Bot, threshold_key: str, r
             history = state.get("forge_history", {})
             history[chat.session_id] = new_sid
             old_sid = chat.session_id
+            chat._forge_pending = True
             chat.session_id = new_sid
             updates = {session_key: new_sid, "forge_history": history}
             if is_new_session_key:
@@ -594,6 +860,9 @@ async def main():
         import weather as weather_mod
         weather_mod.QWEATHER_CITY = saved_city
 
+    WEATHER_PUSH_INTERVAL = 7200  # 2小时
+    last_weather_push = 0.0
+
     chat = ChatProcess(project_dir=PROJECT_DIR, save_state_fn=save_state, channel="xiaoyu")
     if state.get("session_id"):
         chat.session_id = state["session_id"]
@@ -613,6 +882,8 @@ async def main():
     chat_sonnet.set_stream_callback(ws_broadcast)
     message_queue: asyncio.Queue = asyncio.Queue()
     sonnet_queue: asyncio.Queue = asyncio.Queue()
+    deepseek_queue: asyncio.Queue = asyncio.Queue()
+    deepseek_history: list[dict] = []
     group_auto_active = False
     group_round_count = 0
 
@@ -660,7 +931,11 @@ async def main():
                             group_auto_active = False
                             group_round_count = 0
                             await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "user_interrupt"})
-                        if text.startswith("@sonnet ") or text.startswith("@Sonnet "):
+                        if text.startswith("@deepseek ") or text.startswith("@DeepSeek ") or text.startswith("@ds "):
+                            prefix_len = 4 if text.startswith("@ds ") else 10
+                            record_history("user", text, "group")
+                            await deepseek_queue.put(f"[GROUP_TASK]\n{text[prefix_len:]}")
+                        elif text.startswith("@sonnet ") or text.startswith("@Sonnet "):
                             record_history("user", text, "group")
                             await sonnet_queue.put(f"[GROUP_TASK]\n{text[8:]}")
                         elif text.startswith("@小予 "):
@@ -686,8 +961,20 @@ async def main():
                     st = load_state()
                     usage_xiaoyu = chat._current_usage or st.get("last_usage_xiaoyu", {})
                     total_input_xiaoyu = chat.last_total_input
+                    if not total_input_xiaoyu:
+                        saved = st.get("last_total_input_xiaoyu", 0)
+                        if not saved and usage_xiaoyu:
+                            li = (usage_xiaoyu.get("iterations") or [usage_xiaoyu])[-1]
+                            saved = li.get("input_tokens", 0) + li.get("cache_creation_input_tokens", 0) + li.get("cache_read_input_tokens", 0)
+                        total_input_xiaoyu = saved
                     usage_sonnet = chat_sonnet._current_usage or st.get("last_usage_sonnet", {})
                     total_input_sonnet = chat_sonnet.last_total_input
+                    if not total_input_sonnet:
+                        saved_s = st.get("last_total_input_sonnet", 0)
+                        if not saved_s and usage_sonnet:
+                            li_s = (usage_sonnet.get("iterations") or [usage_sonnet])[-1]
+                            saved_s = li_s.get("input_tokens", 0) + li_s.get("cache_creation_input_tokens", 0) + li_s.get("cache_read_input_tokens", 0)
+                        total_input_sonnet = saved_s
                     quota_usage = None
                     weekly_usage = None
                     weather_data = await fetch_weather()
@@ -721,11 +1008,17 @@ async def main():
                     if not history_msgs and not date and channel in ("xiaoyu", "sonnet"):
                         sid = chat_sonnet.session_id if channel == "sonnet" else chat.session_id
                         history_msgs = parse_session_history(sid)
+                    hidden_set = load_state().get("hidden_messages", {}).get(channel, [])
+                    if hidden_set:
+                        for hm in history_msgs:
+                            if hm.get("timestamp") in hidden_set:
+                                hm["hidden"] = True
                     await websocket.send(json.dumps({
                         "type": "history",
                         "messages": history_msgs,
                         "channel": channel,
                         "date": date,
+                        "hidden_timestamps": hidden_set,
                     }, ensure_ascii=False))
 
                 elif msg_type == "get_logs":
@@ -840,6 +1133,94 @@ async def main():
                             "data": weather_data,
                         })
 
+                elif msg_type == "get_emotion_events":
+                    days = msg.get("days", 7)
+                    events = emotion_db.get_recent_events(days=days)
+                    cutoff_30d = (now_local() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                    summary = emotion_db.get_summary(cutoff_30d, now_local().strftime("%Y-%m-%dT%H:%M:%S"))
+                    await websocket.send(json.dumps({
+                        "type": "emotion_events",
+                        "events": events,
+                        "summary": summary,
+                    }, ensure_ascii=False))
+
+                elif msg_type == "emotion_dismiss":
+                    eid = msg.get("id")
+                    if eid:
+                        emotion_db.dismiss_event(eid)
+                        await ws_broadcast({"type": "emotion_event_updated", "id": eid, "state": "dismissed"})
+
+                elif msg_type == "emotion_edit":
+                    eid = msg.get("id")
+                    updates = msg.get("updates", {})
+                    allowed = {"emotion", "intensity", "cause", "state"}
+                    clean = {k: v for k, v in updates.items() if k in allowed}
+                    if eid and clean:
+                        emotion_db.update_event(eid, clean)
+                        await ws_broadcast({"type": "emotion_event_updated", "id": eid, **clean})
+
+                elif msg_type == "hide_messages":
+                    channel = msg.get("channel", "xiaoyu")
+                    timestamps = msg.get("timestamps", [])
+                    if timestamps:
+                        target_chat = chat_sonnet if channel == "sonnet" else chat
+                        sid = target_chat.session_id
+                        messages_to_hide = [{"timestamp": ts, "role": ""} for ts in timestamps]
+                        for ts in timestamps:
+                            for h in load_history(channel=channel):
+                                if h.get("timestamp") == ts:
+                                    for mh in messages_to_hide:
+                                        if mh["timestamp"] == ts:
+                                            mh["role"] = h.get("role", "")
+                                            break
+                                    break
+                        result = context_hide.hide_messages(sid, messages_to_hide)
+                        state = load_state()
+                        hidden_set = state.get("hidden_messages", {})
+                        if channel not in hidden_set:
+                            hidden_set[channel] = []
+                        hidden_set[channel] = list(set(hidden_set[channel] + timestamps))
+                        save_state({"hidden_messages": hidden_set})
+                        await ws_broadcast({
+                            "type": "hide_result",
+                            "success": result.get("success", False),
+                            "channel": channel,
+                            "hidden_timestamps": timestamps if result.get("success") else [],
+                            "error": result.get("error"),
+                        })
+                        if result.get("success") and result.get("removed_count", 0) > 0:
+                            logging.info(f"上下文隐藏: {channel} 隐藏了 {len(timestamps)} 条消息，重启 ChatProcess")
+                            await ws_broadcast({"type": "context_reloading", "channel": channel})
+                            await target_chat.interrupt()
+                            await target_chat.spawn(resume_sid=sid)
+                            await ws_broadcast({"type": "context_reloaded", "channel": channel})
+
+                elif msg_type == "unhide_messages":
+                    channel = msg.get("channel", "xiaoyu")
+                    timestamps = msg.get("timestamps", [])
+                    if timestamps:
+                        target_chat = chat_sonnet if channel == "sonnet" else chat
+                        sid = target_chat.session_id
+                        result = context_hide.unhide_messages(sid, timestamps)
+                        state = load_state()
+                        hidden_set = state.get("hidden_messages", {})
+                        if channel in hidden_set:
+                            hidden_set[channel] = [t for t in hidden_set[channel] if t not in timestamps]
+                        save_state({"hidden_messages": hidden_set})
+                        await ws_broadcast({
+                            "type": "unhide_result",
+                            "success": result.get("success", False),
+                            "channel": channel,
+                            "unhidden_timestamps": timestamps if result.get("success") else [],
+                            "error": result.get("error"),
+                        })
+                        if result.get("success") and result.get("restored_count", 0) > 0:
+                            logging.info(f"上下文恢复: {channel} 恢复了 {len(timestamps)} 条消息，重启 ChatProcess")
+                            await ws_broadcast({"type": "context_reloading", "channel": channel})
+                            await target_chat.interrupt()
+                            await target_chat.spawn(resume_sid=sid)
+                            await ws_broadcast({"type": "context_reloaded", "channel": channel})
+
                 elif msg_type == "ping":
                     pass
 
@@ -909,10 +1290,29 @@ async def main():
             f"（Pro 订阅模式，实际额度消耗请去 claude.ai → Settings → Usage 查看）"
         )
 
+    # ── emotion scan ─────────────────────────────────────────────────────────
+
+    async def _run_emotion_scan():
+        try:
+            st = load_state()
+            last_idx = st.get("emotion_last_scanned_idx", 0)
+            messages = load_history_since_index(last_idx)
+            if not messages:
+                return
+            new_events = await emotion_scanner.run_full_scan(messages)
+            save_state({"emotion_last_scanned_idx": last_idx + len(messages)})
+            if new_events:
+                await log_and_broadcast("info", "emotion", f"检测到 {len(new_events)} 个情绪事件")
+                for ev in new_events:
+                    ev.pop("source_excerpt", None)
+                await ws_broadcast({"type": "emotion_events_new", "events": new_events})
+        except Exception as e:
+            logging.error(f"情绪扫描失败: {e}")
+
     # ── message processor ─────────────────────────────────────────────────────
 
     async def message_processor():
-        nonlocal group_auto_active, group_round_count
+        nonlocal group_auto_active, group_round_count, last_weather_push
         while True:
             item = await message_queue.get()
             if isinstance(item, dict):
@@ -950,6 +1350,44 @@ async def main():
                     text = f"[NEW_SESSION]\n{text}"
                     save_state({"is_new_session": False})
 
+                # 普通聊天时也检查便签信箱
+                if not is_internal:
+                    inbox_notes = check_notes_inbox()
+                    if inbox_notes:
+                        parts = []
+                        for note in inbox_notes:
+                            parts.append(f"--- {note['filename']} ---\n{note['content']}")
+                        notes_inject = (
+                            f"\n[NOTES] 你有 {len(inbox_notes)} 封新便签：\n"
+                            + "\n".join(parts) + "\n"
+                        )
+                        text = f"{notes_inject}\n{text}"
+                        for note in inbox_notes:
+                            archive_inbox_note(note["path"])
+
+                # 情绪备忘注入
+                if not is_internal:
+                    open_emotions = emotion_db.get_sanitized_memo()
+                    if open_emotions:
+                        def _age_desc(ts_str):
+                            try:
+                                dt = datetime.fromisoformat(ts_str)
+                                delta = datetime.now() - dt
+                                if delta.total_seconds() < 3600:
+                                    return f"{int(delta.total_seconds()//60)}分钟前"
+                                elif delta.total_seconds() < 86400:
+                                    return f"{int(delta.total_seconds()//3600)}小时前"
+                                else:
+                                    return f"{int(delta.days)}天前"
+                            except Exception:
+                                return "之前"
+                        memo_lines = []
+                        for ev in open_emotions[:5]:
+                            who = "她" if ev["subject"] == "user" else "你"
+                            memo_lines.append(f"  - {who} {_age_desc(ev['timestamp'])} 有{ev['emotion']}情绪（{ev.get('cause', '未知')}）")
+                        emotion_inject = "[情绪备忘] 当前未消解的情绪：\n" + "\n".join(memo_lines)
+                        text = f"{emotion_inject}\n{text}"
+
                 total_input = chat.last_total_input
                 if total_input > 0:
                     WARN_THRESHOLD = FORGE_THRESHOLD - 10000
@@ -968,7 +1406,13 @@ async def main():
 
                 from datetime import datetime
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
-                text = f"[当前时间：{now_str}]\n{text}"
+                weather_inject = ""
+                if not is_internal and time.time() - last_weather_push >= WEATHER_PUSH_INTERVAL:
+                    w = await fetch_weather()
+                    if w:
+                        weather_inject = f"\n[天气：{weather_summary(w)}]"
+                        last_weather_push = time.time()
+                text = f"[当前时间：{now_str}]{weather_inject}\n{text}"
 
                 result = await chat.send(text)
 
@@ -988,33 +1432,71 @@ async def main():
                     await _send_with_retry(bot, err_msg)
                     await log_and_broadcast("error", "error", err_msg)
 
+                # 先检测任务，再发回复（私聊时需要剥离任务标记）
+                task, target = detect_and_extract_task(result["text"])
                 reply, nw = extract_next_wake(result["text"])
                 if nw:
                     set_next_wake(nw, user_set=True)
+
+                # 私聊时剥离 [TASK_FOR_*] 标记，只留聊天部分
+                if task and not is_group:
+                    reply = strip_task_markers(reply)
+
                 await send_reply(bot, reply, thinking=result["thinking"])
                 await log_and_broadcast("info", "message", f"回复已发送（{source_channel}）", {"text": reply[:100]})
 
                 record_history("assistant", reply, source_channel, sender="xiaoyu",
                                thinking=result.get("thinking"))
 
-                # 群聊自动路由：检测小予是否派活给 Sonnet
-                if is_group or group_auto_active:
-                    task = detect_and_extract_task(result["text"])
-                    if task:
-                        group_auto_active = True
-                        group_round_count += 1
-                        if group_round_count > GROUP_MAX_ROUNDS:
-                            group_auto_active = False
-                            group_round_count = 0
-                            await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "max_rounds"})
-                        else:
-                            await ws_broadcast({"type": "group_auto_status", "active": True, "round": group_round_count, "max_rounds": GROUP_MAX_ROUNDS})
-                            await log_and_broadcast("info", "activity", f"派活给 Sonnet（第 {group_round_count}/{GROUP_MAX_ROUNDS} 轮）", {"task": task[:200]})
-                            await sonnet_queue.put(f"[GROUP_TASK]\n{task}")
-                    elif group_auto_active:
+                # 情绪扫描触发
+                if not is_internal:
+                    _es = load_state()
+                    _scan_count = _es.get("emotion_scan_msg_count", 0) + 2
+                    if _scan_count >= EMOTION_SCAN_INTERVAL:
+                        save_state({"emotion_scan_msg_count": 0})
+                        asyncio.create_task(_run_emotion_scan())
+                    else:
+                        save_state({"emotion_scan_msg_count": _scan_count})
+
+                # 私聊派活时，通知前端修正已流式渲染的消息（去掉任务标记部分）
+                if task and not is_group:
+                    await ws_broadcast({
+                        "type": "message_correct",
+                        "channel": source_channel,
+                        "sender": "xiaoyu",
+                        "text": reply,
+                    })
+
+                # 派活一律走群聊：任务以小予气泡出现在群聊，Sonnet/DeepSeek 在群聊回复
+                if task:
+                    group_auto_active = True
+                    group_round_count += 1
+                    if group_round_count > GROUP_MAX_ROUNDS:
                         group_auto_active = False
                         group_round_count = 0
-                        await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "no_more_tasks"})
+                        await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "max_rounds"})
+                    else:
+                        # 任务以小予的气泡显示在群聊
+                        await ws_broadcast({
+                            "type": "user_message",
+                            "text": task,
+                            "channel": "group",
+                            "sender": "xiaoyu",
+                            "timestamp": now_local().isoformat(),
+                        })
+                        record_history("user", task, "group", sender="xiaoyu")
+
+                        await ws_broadcast({"type": "group_auto_status", "active": True, "round": group_round_count, "max_rounds": GROUP_MAX_ROUNDS})
+                        if target == "deepseek":
+                            await log_and_broadcast("info", "activity", f"派活给 DeepSeek（第 {group_round_count}/{GROUP_MAX_ROUNDS} 轮）", {"task": task[:200]})
+                            await deepseek_queue.put(f"[GROUP_TASK]\n{task}")
+                        else:
+                            await log_and_broadcast("info", "activity", f"派活给 Sonnet（第 {group_round_count}/{GROUP_MAX_ROUNDS} 轮）", {"task": task[:200]})
+                            await sonnet_queue.put(f"[GROUP_TASK]\n{task}")
+                elif group_auto_active:
+                    group_auto_active = False
+                    group_round_count = 0
+                    await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "no_more_tasks"})
 
             except Exception as e:
                 logging.error(f"消息处理失败: {e}")
@@ -1079,6 +1561,71 @@ async def main():
                 if is_group_task:
                     chat_sonnet.set_stream_callback(ws_broadcast)
 
+    # ── deepseek processor ─────────────────────────────────────────────────
+    async def deepseek_processor():
+        nonlocal group_auto_active, group_round_count
+        while True:
+            text = await deepseek_queue.get()
+            is_group_task = text.startswith("[GROUP_TASK]\n")
+            if is_group_task:
+                text = text[len("[GROUP_TASK]\n"):]
+
+            if not is_group_task:
+                record_history("user", text, "group")
+
+            try:
+                await ws_broadcast({
+                    "type": "stream_text", "text": "", "full_text": "（DeepSeek 查询中…）",
+                    "channel": "group", "sender": "deepseek",
+                })
+
+                result_text = await deepseek_chat(
+                    [{"role": "user", "content": text}],
+                    deepseek_history,
+                )
+
+                deepseek_history.append({"role": "user", "content": text})
+                deepseek_history.append({"role": "assistant", "content": result_text})
+                if len(deepseek_history) > 10:
+                    deepseek_history[:] = deepseek_history[-10:]
+
+                await ws_broadcast({
+                    "type": "stream_text", "text": result_text, "full_text": result_text,
+                    "channel": "group", "sender": "deepseek",
+                })
+                await ws_broadcast({
+                    "type": "reply_done", "text": result_text, "thinking": "",
+                    "usage": {}, "total_input": 0, "cost_this_turn": 0,
+                    "session_id": "", "channel": "group", "sender": "deepseek",
+                })
+
+                record_history("assistant", result_text, "group", sender="deepseek")
+                await log_and_broadcast("info", "activity", "DeepSeek 完成任务", {"text": result_text[:200]})
+
+                summary = result_text[:2000]
+                if is_group_task and group_auto_active:
+                    review_msg = (
+                        f"[DEEPSEEK_RESULT]\n"
+                        f"DeepSeek 查到了，以下是结果：\n\n{summary}\n\n"
+                        f"如果还有后续查询请用 [TASK_FOR_DEEPSEEK] 标记派发。"
+                    )
+                    await message_queue.put({"text": review_msg, "channel": "group"})
+                elif not is_group_task:
+                    review_msg = (
+                        f"[DEEPSEEK_RESULT]\n"
+                        f"DeepSeek 查完了：\n\n{summary}"
+                    )
+                    await message_queue.put({"text": review_msg, "channel": "xiaoyu"})
+
+            except Exception as e:
+                logging.error(f"DeepSeek 处理失败: {e}")
+                await ws_broadcast({"type": "error", "message": f"DeepSeek 出错: {e}", "channel": "group"})
+                await ws_broadcast({"type": "stream_end", "channel": "group", "sender": "deepseek"})
+                if is_group_task and group_auto_active:
+                    group_auto_active = False
+                    group_round_count = 0
+                    await ws_broadcast({"type": "group_auto_status", "active": False, "round": 0, "max_rounds": GROUP_MAX_ROUNDS, "reason": "error"})
+
     # ── wakeup ────────────────────────────────────────────────────────────────
 
     async def scheduled_wake_check():
@@ -1092,6 +1639,7 @@ async def main():
         await do_wakeup()
 
     async def do_wakeup():
+        nonlocal last_weather_push
         if not is_active_time() and not load_state().get("wake_is_user_set"):
             defer_to_active_start()
             return
@@ -1106,12 +1654,30 @@ async def main():
 
         weather_data = await fetch_weather()
         weather_line = f"天气：{weather_summary(weather_data)}\n" if weather_data else ""
+        if weather_data:
+            last_weather_push = time.time()
+
+        # 检查便签信箱
+        inbox_notes = check_notes_inbox()
+        notes_section = ""
+        if inbox_notes:
+            parts = []
+            for note in inbox_notes:
+                parts.append(f"--- {note['filename']} ---\n{note['content']}")
+            notes_section = (
+                f"\n[NOTES] 你有 {len(inbox_notes)} 封新便签：\n"
+                + "\n".join(parts)
+                + "\n读完后请用 Read 工具确认内容，便签会自动归档。\n"
+            )
+            for note in inbox_notes:
+                archive_inbox_note(note["path"])
 
         wakeup_msg = (
             f"{new_session_tag}"
             f"[WAKEUP]\n"
             f"现在是 {now_str}，距离上次聊天已经过去了 {silence}。\n"
             f"{weather_line}"
+            f"{notes_section}"
             f"这是你的自由时间。请按照 CLAUDE.md 中的唤醒行为规则回复。"
         )
 
@@ -1133,7 +1699,7 @@ async def main():
                     await log_and_broadcast("warning", "error", "唤醒消息发送失败")
 
             await log_and_broadcast("info", "activity", f"唤醒结果：action={parsed['action']}")
-            set_next_wake(parsed["next_minutes"])
+            set_next_wake(parsed["next_minutes"], user_set=True)
         except Exception as e:
             logging.error(f"唤醒流程失败: {e}")
             await log_and_broadcast("error", "error", f"唤醒流程失败: {e}")
@@ -1145,6 +1711,30 @@ async def main():
         if chat_sonnet.is_idle(idle_seconds=1800) and chat_sonnet.proc and chat_sonnet.proc.returncode is None:
             await chat_sonnet.stop()
             await log_and_broadcast("info", "activity", "Sonnet 子进程因空闲 30 分钟已回收")
+
+    async def check_outbox():
+        """Check if 小予 wrote any notes in outbox and notify user via Telegram."""
+        outbox_files = check_notes_outbox()
+        if not outbox_files:
+            return
+        state = load_state()
+        notified = set(state.get("notified_outbox_notes", []))
+        new_notes = [f for f in outbox_files if f not in notified]
+        if not new_notes:
+            return
+        for fname in new_notes:
+            note_path = NOTES_OUTBOX / fname
+            try:
+                content = note_path.read_text(encoding="utf-8")
+                preview = content[:200] + ("…" if len(content) > 200 else "")
+                await _send_with_retry(bot, f"✉️ 小予给chat端的自己写了一封信：{fname}\n\n{preview}\n\n（完整内容在 notes/outbox/{fname}）")
+            except Exception:
+                await _send_with_retry(bot, f"✉️ 小予写了一封信：{fname}")
+            notified.add(fname)
+            await log_and_broadcast("info", "notes", f"检测到小予写了便签: {fname}")
+        # 清理已不在 outbox 的旧记录
+        notified = {f for f in notified if f in outbox_files or f in new_notes}
+        save_state({"notified_outbox_notes": list(notified)})
 
     # ── app setup ─────────────────────────────────────────────────────────────
 
@@ -1158,12 +1748,45 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(scheduled_wake_check, "interval", minutes=5)
     scheduler.add_job(idle_check, "interval", minutes=5)
+    scheduler.add_job(check_outbox, "interval", minutes=5)
+
+    from emotion_scheduler import emotion_unresolved_check, emotion_digest_check, emotion_startup_check
+    scheduler.add_job(lambda: asyncio.create_task(emotion_unresolved_check()), "interval", hours=1)
+    scheduler.add_job(lambda: asyncio.create_task(emotion_digest_check()), "interval", hours=6)
+
     scheduler.start()
 
-    set_next_wake(DEFAULT_INTERVAL)
+    asyncio.create_task(emotion_startup_check())
+
+    global _schedule_precise_wake
+    def _do_schedule_precise(wake_time):
+        try:
+            scheduler.remove_job("precise_wake")
+        except Exception:
+            pass
+        if wake_time > now_local():
+            scheduler.add_job(
+                scheduled_wake_check, "date",
+                run_date=wake_time, id="precise_wake",
+            )
+    _schedule_precise_wake = _do_schedule_precise
+
+    _st = load_state()
+    _existing_wake = _st.get("next_wake")
+    if _existing_wake:
+        _wake_dt = datetime.fromisoformat(_existing_wake)
+        if _wake_dt > now_local():
+            logging.info(f"保留唤醒时间：{_existing_wake}")
+            _do_schedule_precise(_wake_dt)
+        else:
+            logging.info(f"检测到错过的唤醒（{_existing_wake}），立即执行")
+            asyncio.create_task(do_wakeup())
+    else:
+        set_next_wake(DEFAULT_INTERVAL)
 
     proc_task = asyncio.create_task(message_processor())
     sonnet_task = asyncio.create_task(sonnet_processor())
+    deepseek_task = asyncio.create_task(deepseek_processor())
 
     ws_server = await websockets.serve(ws_handler, "0.0.0.0", WS_PORT)
     logging.info(f"WebSocket 服务已启动，端口 {WS_PORT}")
@@ -1200,6 +1823,7 @@ async def main():
         finally:
             proc_task.cancel()
             sonnet_task.cancel()
+            deepseek_task.cancel()
             ws_server.close()
             await ws_server.wait_closed()
             scheduler.shutdown()

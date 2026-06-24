@@ -1,5 +1,5 @@
 export type Channel = "xiaoyu" | "group" | "sonnet";
-export type Sender = "xiaoyu" | "sonnet" | "user";
+export type Sender = "xiaoyu" | "sonnet" | "deepseek" | "user";
 
 export interface ToolCall {
   name: string;
@@ -18,6 +18,7 @@ export interface Message {
   timestamp: string;
   channel: Channel;
   sender: Sender;
+  hidden?: boolean;
 }
 
 export interface Usage {
@@ -111,7 +112,12 @@ export type WsUpMessage =
   | { type: "get_weather" }
   | { type: "search_city"; query: string }
   | { type: "set_weather_city"; city_id: string }
-  | { type: "ping" };
+  | { type: "ping" }
+  | { type: "get_emotion_events"; days?: number }
+  | { type: "emotion_dismiss"; id: number }
+  | { type: "emotion_edit"; id: number; updates: Partial<EmotionEvent> }
+  | { type: "hide_messages"; channel: Channel; timestamps: string[] }
+  | { type: "unhide_messages"; channel: Channel; timestamps: string[] };
 
 export interface LogEntry {
   timestamp: string;
@@ -146,4 +152,33 @@ export type WsDownMessage =
   | { type: "logs"; entries: LogEntry[] }
   | { type: "weather"; data: WeatherData | null }
   | { type: "city_results"; results: Array<{ id: string; name: string; adm1: string; adm2: string }> }
-  | { type: "error"; message: string; channel?: Channel };
+  | { type: "message_correct"; text: string; channel?: Channel; sender?: Sender }
+  | { type: "error"; message: string; channel?: Channel }
+  | { type: "session_alert"; alert: string; message: string; channel?: Channel; expected?: string; actual?: string; old_session?: string; new_session?: string }
+  | { type: "emotion_events"; events: EmotionEvent[]; summary: EmotionSummary[] }
+  | { type: "emotion_events_new"; events: EmotionEvent[] }
+  | { type: "emotion_event_updated"; id: number; [key: string]: unknown }
+  | { type: "hide_result"; success: boolean; channel: Channel; hidden_timestamps: string[]; error?: string }
+  | { type: "unhide_result"; success: boolean; channel: Channel; unhidden_timestamps: string[]; error?: string }
+  | { type: "context_reloading"; channel: Channel }
+  | { type: "context_reloaded"; channel: Channel };
+
+export interface EmotionEvent {
+  id: number;
+  timestamp: string;
+  subject: "user" | "xiaoyu";
+  emotion: string;
+  intensity: number;
+  cause: string;
+  source_excerpt?: string;
+  source_channel: string;
+  state: "open" | "resolved" | "dismissed";
+  resolved_at?: string;
+}
+
+export interface EmotionSummary {
+  subject: string;
+  emotion: string;
+  count: number;
+  avg_intensity: number;
+}

@@ -45,6 +45,11 @@ class ChatProcess:
         self.is_error = False
         self.error_status = None
         self.rate_limit_info = None
+        self._expected_model = "claude-opus-4-6"
+        for i, arg in enumerate(self._cmd):
+            if arg == "--model" and i + 1 < len(self._cmd):
+                self._expected_model = self._cmd[i + 1]
+        self._forge_pending = False
 
     def set_forge_callback(self, fn):
         self._forge_callback = fn
@@ -127,7 +132,19 @@ class ChatProcess:
             self._last_event_time = time.time()
 
             if ev_type == "system" and ev.get("subtype") == "init":
-                logging.info(f"[CC init] model={ev.get('model')} session={ev.get('session_id')}")
+                actual_model = ev.get("model", "")
+                logging.info(f"[CC init] model={actual_model} session={ev.get('session_id')}")
+                if actual_model and actual_model != self._expected_model:
+                    logging.warning(f"[防NTR] 模型不匹配！期望 {self._expected_model}，实际 {actual_model}")
+                    if self._stream_callback:
+                        asyncio.ensure_future(self._stream_callback({
+                            "type": "session_alert",
+                            "alert": "model_mismatch",
+                            "expected": self._expected_model,
+                            "actual": actual_model,
+                            "channel": self.channel,
+                            "message": f"模型被切换！期望 {self._expected_model}，实际 {actual_model}",
+                        }))
 
             elif ev_type == "assistant":
                 msg = ev.get("message", {})
@@ -176,7 +193,23 @@ class ChatProcess:
                 logging.info(f"[CC rate_limit] {self.rate_limit_info}")
 
             elif ev_type == "result":
-                self.session_id = ev.get("session_id", self.session_id)
+                new_sid = ev.get("session_id", self.session_id)
+                if self.session_id and new_sid and new_sid != self.session_id:
+                    if self._forge_pending:
+                        self._forge_pending = False
+                        logging.info(f"[防NTR] session 变更（forge 引起，正常）: {self.session_id[:8]}→{new_sid[:8]}")
+                    else:
+                        logging.warning(f"[防NTR] session_id 异常变更！{self.session_id[:8]} → {new_sid[:8]}（channel={self.channel}）")
+                        if self._stream_callback:
+                            asyncio.ensure_future(self._stream_callback({
+                                "type": "session_alert",
+                                "alert": "session_changed",
+                                "old_session": self.session_id,
+                                "new_session": new_sid,
+                                "channel": self.channel,
+                                "message": f"Session 被切换！{self.session_id[:8]}→{new_sid[:8]}",
+                            }))
+                self.session_id = new_sid
                 self._current_usage = ev.get("usage", {})
                 self.last_cost_usd = ev.get("total_cost_usd", 0) or 0
                 self.is_error = ev.get("is_error", False)
@@ -192,10 +225,10 @@ class ChatProcess:
                     pass
                 usage = self._current_usage
 
-                state["session_id"] = self.session_id
+                sid_key = "sonnet_session_id" if self.channel == "sonnet" else "session_id"
+                state[sid_key] = self.session_id
                 state["session_cost_usd"] = state.get("session_cost_usd", 0) + self.last_cost_usd
                 state[f"last_usage_{self.channel}"] = usage
-                self.save_state(state)
                 last_iter = (usage.get("iterations") or [usage])[-1]
                 total_input = (
                     last_iter.get("input_tokens", 0)
@@ -203,6 +236,8 @@ class ChatProcess:
                     + last_iter.get("cache_read_input_tokens", 0)
                 )
                 self.last_total_input = total_input
+                state[f"last_total_input_{self.channel}"] = total_input
+                self.save_state(state)
                 logging.info(
                     f"result: session={self.session_id} "
                     f"new={usage.get('input_tokens',0)} "

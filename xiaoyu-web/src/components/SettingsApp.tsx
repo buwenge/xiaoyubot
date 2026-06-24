@@ -6,7 +6,6 @@ import { StatusPanel } from "./StatusPanel";
 import { LogPanel } from "./LogPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { IconBack } from "./Icons";
-import { ThemeToggle } from "./ThemeToggle";
 
 type Tab = "status" | "logs" | "settings";
 
@@ -54,7 +53,7 @@ export function SettingsApp({
             </button>
             <span className="text-sm font-medium text-warm-text">管理</span>
           </div>
-          <ThemeToggle />
+          <div className="w-8" />
         </div>
 
         {/* Tab bar */}

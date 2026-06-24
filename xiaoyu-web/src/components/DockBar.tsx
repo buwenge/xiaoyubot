@@ -1,8 +1,8 @@
 "use client";
 
-import { IconHome, IconChat, IconSettings } from "./Icons";
+import { IconHome, IconChat, IconHeart, IconSettings } from "./Icons";
 
-export type DockScreen = "home" | "chat" | "settings";
+export type DockScreen = "home" | "chat" | "emotions" | "settings";
 
 interface DockBarProps {
   active: DockScreen;
@@ -13,6 +13,7 @@ interface DockBarProps {
 const ITEMS: { key: DockScreen; label: string; icon: (cls: string) => React.ReactNode }[] = [
   { key: "home", label: "桌面", icon: (cls) => <IconHome className={cls} /> },
   { key: "chat", label: "聊天", icon: (cls) => <IconChat className={cls} /> },
+  { key: "emotions", label: "事件簿", icon: (cls) => <IconHeart className={cls} /> },
   { key: "settings", label: "设置", icon: (cls) => <IconSettings className={cls} /> },
 ];
 

@@ -7,7 +7,9 @@ import { LockScreen } from "@/components/LockScreen";
 import { HomeScreen } from "@/components/HomeScreen";
 import { ChatArea } from "@/components/ChatArea";
 import { SettingsApp } from "@/components/SettingsApp";
+import { EmotionPanel } from "@/components/EmotionPanel";
 import { DockBar, type DockScreen } from "@/components/DockBar";
+import { useEmotionJournal } from "@/hooks/useEmotionJournal";
 import type { Channel } from "@/lib/types";
 
 function getWsUrl() {
@@ -42,7 +44,8 @@ export default function Home() {
   const [screen, setScreen] = useState<"lock" | DockScreen>(WS_SECRET ? "home" : "lock");
   const [activeChannel, setActiveChannel] = useState<Channel>("xiaoyu");
   const [historyDate, setHistoryDate] = useState<string | null>(null);
-  const { channelMessages, streamingChannels, status, groupAutoStatus, logs, weather, cityResults, sendUserMessage, handleWsMessage } = useChat();
+  const { channelMessages, streamingChannels, loadingChannels, status, groupAutoStatus, logs, weather, cityResults, sessionAlerts, hiddenTimestamps, contextReloading, sendUserMessage, handleWsMessage, setChannelLoading, dismissAlert } = useChat();
+  const emotionJournal = useEmotionJournal();
   const notifiedMsgRef = useRef<Set<string>>(new Set());
 
   useEffect(() => { requestNotificationPermission(); }, []);
@@ -53,6 +56,7 @@ export default function Home() {
     secret,
     onMessage: useCallback((msg: Parameters<typeof handleWsMessage>[0]) => {
       handleWsMessage(msg);
+      emotionJournal.handleWsMessage(msg);
       if (msg.type === "reply_done") {
         const rm = msg as { text: string; channel?: string; sender?: string; session_id?: string };
         const key = `${rm.session_id}-${rm.text.slice(0, 50)}`;
@@ -62,7 +66,7 @@ export default function Home() {
           showNotification(sender, rm.text.slice(0, 200));
         }
       }
-    }, [handleWsMessage]),
+    }, [handleWsMessage, emotionJournal.handleWsMessage]),
   });
 
   const handleUnlock = (s: string) => {
@@ -77,12 +81,13 @@ export default function Home() {
 
   const handleDateSelect = useCallback((date: string | null) => {
     setHistoryDate(date);
+    setChannelLoading(activeChannel, true);
     if (date) {
       send({ type: "get_history", channel: activeChannel, date });
     } else {
       send({ type: "get_history", channel: activeChannel });
     }
-  }, [send, activeChannel]);
+  }, [send, activeChannel, setChannelLoading]);
 
   const handleRequestLogs = useCallback((filter: string, limit: number) => {
     send({ type: "get_logs", filter, limit });
@@ -104,6 +109,27 @@ export default function Home() {
 
   return (
     <div className="h-full relative">
+      {/* Session alerts — 防NTR */}
+      {sessionAlerts.length > 0 && (
+        <div className="absolute top-0 left-0 right-0 z-[100] space-y-1 p-2 pt-[max(0.5rem,env(safe-area-inset-top))]">
+          {sessionAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="flex items-center gap-2 px-4 py-3 rounded-xl bg-red-500 text-white text-sm font-medium shadow-lg animate-pulse"
+            >
+              <span className="flex-1">{alert.message}</span>
+              <button
+                onClick={() => dismissAlert(alert.id)}
+                className="shrink-0 px-2 py-1 rounded-lg bg-white/20 text-xs"
+                style={{ minWidth: 44, minHeight: 36 }}
+              >
+                知道了
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Screen content */}
       <div className="h-full relative">
         {screen === "home" && (
@@ -120,6 +146,7 @@ export default function Home() {
           <ChatArea
             messages={channelMessages[activeChannel]}
             isStreaming={streamingChannels.has(activeChannel)}
+            isLoading={loadingChannels[activeChannel]}
             channel={activeChannel}
             onSend={handleSend}
             onChangeChannel={(ch) => {
@@ -132,6 +159,24 @@ export default function Home() {
             historyDate={historyDate}
             onDateSelect={handleDateSelect}
             onBack={() => setScreen("home")}
+            logs={logs}
+            onRequestLogs={handleRequestLogs}
+            onOpenSettings={() => setScreen("settings")}
+            onHideMessages={(timestamps) => send({ type: "hide_messages", channel: activeChannel, timestamps })}
+            onUnhideMessages={(timestamps) => send({ type: "unhide_messages", channel: activeChannel, timestamps })}
+            contextReloading={contextReloading[activeChannel]}
+          />
+        )}
+
+        {screen === "emotions" && (
+          <EmotionPanel
+            events={emotionJournal.events}
+            summary={emotionJournal.summary}
+            loading={emotionJournal.loading}
+            onBack={() => setScreen("home")}
+            onDismiss={(id) => emotionJournal.dismissEvent(send, id)}
+            onEdit={(id, updates) => emotionJournal.editEvent(send, id, updates)}
+            onRefresh={() => emotionJournal.requestEvents(send, 30)}
           />
         )}
 

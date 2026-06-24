@@ -110,7 +110,9 @@ def weather_summary(data: dict | None) -> str:
     """生成给小予看的天气摘要"""
     if not data:
         return ""
-    parts = [f"{data['temp']}°C {data['text']}"]
+    city = data.get("cityName", "")
+    prefix = f"{city} " if city else ""
+    parts = [f"{prefix}{data['temp']}°C {data['text']}"]
     if data.get("humidity"):
         parts.append(f"湿度{data['humidity']}%")
     if data.get("windDir"):

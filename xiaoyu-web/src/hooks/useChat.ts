@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Channel, GroupAutoStatus, LogEntry, Message, Sender, StatusData, WeatherData, WsDownMessage } from "@/lib/types";
 
 type ChannelMessages = Record<Channel, Message[]>;
+type ChannelLoading = Record<Channel, boolean>;
 
 const STORAGE_KEY = "xiaoyu_chat_messages";
 const MAX_STORED_PER_CHANNEL = 200;
@@ -39,7 +40,19 @@ export function useChat() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [cityResults, setCityResults] = useState<Array<{ id: string; name: string; adm1: string; adm2: string }>>([]);
+  const [loadingChannels, setLoadingChannels] = useState<ChannelLoading>({ xiaoyu: true, group: true, sonnet: true });
+  const [sessionAlerts, setSessionAlerts] = useState<Array<{ id: string; alert: string; message: string; channel?: string; timestamp: string }>>([]);
+  const [hiddenTimestamps, setHiddenTimestamps] = useState<Record<Channel, Set<string>>>({
+    xiaoyu: new Set(), group: new Set(), sonnet: new Set(),
+  });
+  const [contextReloading, setContextReloading] = useState<Record<Channel, boolean>>({
+    xiaoyu: false, group: false, sonnet: false,
+  });
   const idCounter = useRef(0);
+
+  const streamRef = useRef<Record<string, { text: string; thinking: string }>>({});
+  const streamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const STREAM_FLUSH_MS = 50;
 
   const nextId = () => `msg-${++idCounter.current}`;
 
@@ -73,36 +86,84 @@ export function useChat() {
     setStreaming(channel, true);
   }, []);
 
+  const flushStreams = useCallback(() => {
+    const pending = streamRef.current;
+    const keys = Object.keys(pending);
+    if (keys.length === 0) return;
+    for (const key of keys) {
+      const [ch, sender] = key.split(":") as [Channel, string];
+      const data = pending[key];
+      updateChannel(ch, (prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.isStreaming && last.sender === sender) {
+          return [...prev.slice(0, -1), {
+            ...last,
+            text: data.text || last.text,
+            thinking: data.thinking || last.thinking,
+          }];
+        }
+        return prev;
+      });
+    }
+  }, []);
+
   const handleWsMessage = useCallback((msg: WsDownMessage) => {
     switch (msg.type) {
       case "user_message": {
-        const um = msg as WsDownMessage & { text: string; timestamp: string; channel?: Channel };
+        const um = msg as WsDownMessage & { text: string; timestamp: string; channel?: Channel; sender?: string };
         const ch = um.channel || "xiaoyu";
+        const umSender = (um.sender || "user") as Sender;
+        const role = umSender === "user" ? "user" as const : "assistant" as const;
         updateChannel(ch, (prev) => {
-          if (prev.length > 0 && prev[prev.length - 1].role === "user" && prev[prev.length - 1].text === um.text) {
+          if (prev.length > 0 && prev[prev.length - 1].text === um.text && prev[prev.length - 1].sender === umSender) {
             return prev;
           }
           return [...prev, {
             id: nextId(),
-            role: "user" as const,
+            role,
             text: um.text,
             isStreaming: false,
             timestamp: um.timestamp,
             channel: ch,
-            sender: "user" as const,
+            sender: umSender,
           }];
         });
-        setStreaming(ch, true);
+        if (role === "user") setStreaming(ch, true);
+        break;
+      }
+      case "message_correct": {
+        const mc = msg as WsDownMessage & { text: string; channel?: Channel; sender?: string };
+        const ch = mc.channel || "xiaoyu";
+        const mcSender = mc.sender || "xiaoyu";
+        updateChannel(ch, (prev) => {
+          const idx = prev.length - 1;
+          while (idx >= 0) {
+            if (prev[idx].role === "assistant" && prev[idx].sender === mcSender) {
+              const updated = [...prev];
+              updated[idx] = { ...updated[idx], text: mc.text };
+              return updated;
+            }
+            break;
+          }
+          return prev;
+        });
         break;
       }
       case "stream_text": {
         const ch = msg.channel || "xiaoyu";
         const sender = msg.sender || ch;
+        const key = `${ch}:${sender}`;
+        if (!streamRef.current[key]) streamRef.current[key] = { text: "", thinking: "" };
+        streamRef.current[key].text = msg.full_text;
+        if (!streamTimerRef.current) {
+          streamTimerRef.current = setTimeout(() => {
+            streamTimerRef.current = null;
+            flushStreams();
+          }, STREAM_FLUSH_MS);
+        }
         updateChannel(ch, (prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.isStreaming && last.sender === sender) {
-            return [...prev.slice(0, -1), { ...last, text: msg.full_text }];
-          }
+          if (last?.role === "assistant" && last.isStreaming && last.sender === sender) return prev;
           return [...prev, {
             id: nextId(),
             role: "assistant" as const,
@@ -118,11 +179,18 @@ export function useChat() {
       case "stream_thinking": {
         const ch = msg.channel || "xiaoyu";
         const sender = msg.sender || ch;
+        const key = `${ch}:${sender}`;
+        if (!streamRef.current[key]) streamRef.current[key] = { text: "", thinking: "" };
+        streamRef.current[key].thinking = msg.full_thinking;
+        if (!streamTimerRef.current) {
+          streamTimerRef.current = setTimeout(() => {
+            streamTimerRef.current = null;
+            flushStreams();
+          }, STREAM_FLUSH_MS);
+        }
         updateChannel(ch, (prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.isStreaming && last.sender === sender) {
-            return [...prev.slice(0, -1), { ...last, thinking: msg.full_thinking }];
-          }
+          if (last?.role === "assistant" && last.isStreaming && last.sender === sender) return prev;
           return [...prev, {
             id: nextId(),
             role: "assistant" as const,
@@ -138,28 +206,57 @@ export function useChat() {
       }
       case "tool_use": {
         const ch = msg.channel || "xiaoyu";
+        const sender = msg.sender || ch;
         updateChannel(ch, (prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.isStreaming) {
+          if (last?.role === "assistant" && last.isStreaming && last.sender === sender) {
             const existing = last.toolCalls || [];
             const dup = existing.some((tc) => tc.name === msg.name && tc.input === msg.input);
             if (dup) return prev;
             const toolCalls = [...existing, { name: msg.name, input: msg.input }];
             return [...prev.slice(0, -1), { ...last, toolCalls }];
           }
-          return prev;
+          return [...prev, {
+            id: nextId(),
+            role: "assistant" as const,
+            text: "",
+            toolCalls: [{ name: msg.name, input: msg.input }],
+            isStreaming: true,
+            timestamp: new Date().toISOString(),
+            channel: ch,
+            sender: sender as Message["sender"],
+          }];
         });
         break;
       }
       case "reply_done": {
         const ch = msg.channel || "xiaoyu";
+        if (streamTimerRef.current) {
+          clearTimeout(streamTimerRef.current);
+          streamTimerRef.current = null;
+        }
+        const senderKey = `${ch}:${msg.sender || ch}`;
+        delete streamRef.current[senderKey];
         updateChannel(ch, (prev) => {
           const last = prev[prev.length - 1];
           if (last?.role === "assistant" && last.isStreaming) {
-            return [
-              ...prev.slice(0, -1),
-              { ...last, text: msg.text, thinking: msg.thinking || last.thinking, isStreaming: false },
-            ];
+            const fullText = msg.text || "";
+            const parts = fullText.split(/\n\n+/).map((p: string) => p.trim()).filter(Boolean);
+            if (parts.length <= 1) {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, text: fullText, thinking: msg.thinking || last.thinking, isStreaming: false },
+              ];
+            }
+            const newMsgs: Message[] = parts.map((part: string, i: number) => ({
+              ...last,
+              id: i === 0 ? last.id : nextId(),
+              text: part,
+              thinking: i === 0 ? (msg.thinking || last.thinking) : undefined,
+              toolCalls: i === 0 ? last.toolCalls : undefined,
+              isStreaming: false,
+            }));
+            return [...prev.slice(0, -1), ...newMsgs];
           }
           return prev;
         });
@@ -228,21 +325,46 @@ export function useChat() {
         break;
       }
       case "history": {
-        const hm = msg as WsDownMessage & { messages: Array<{ role: string; text: string; thinking?: string; tool_calls?: Array<{ name: string; input: string }>; timestamp: string; sender?: string }>; channel?: Channel };
+        const hm = msg as WsDownMessage & { messages: Array<{ role: string; text: string; thinking?: string; tool_calls?: Array<{ name: string; input: string }>; timestamp: string; sender?: string; hidden?: boolean }>; channel?: Channel; hidden_timestamps?: string[] };
         const ch = hm.channel || "xiaoyu";
+        if (hm.hidden_timestamps?.length) {
+          setHiddenTimestamps((prev) => {
+            const next = { ...prev };
+            next[ch] = new Set([...prev[ch], ...(hm.hidden_timestamps || [])]);
+            return next;
+          });
+        }
         const defaultSender: Sender = ch === "sonnet" ? "sonnet" : "xiaoyu";
-        const historyMessages: Message[] = hm.messages.map((m) => ({
-          id: nextId(),
-          role: m.role as "user" | "assistant",
-          text: m.text,
-          thinking: m.thinking,
-          toolCalls: m.tool_calls,
-          isStreaming: false,
-          timestamp: m.timestamp,
-          channel: ch,
-          sender: (m.sender as Sender) || (m.role === "user" ? "user" : defaultSender),
-        }));
+        const historyMessages: Message[] = [];
+        for (const m of hm.messages) {
+          const sender = (m.sender as Sender) || (m.role === "user" ? "user" : defaultSender);
+          const base = {
+            role: m.role as "user" | "assistant",
+            isStreaming: false,
+            timestamp: m.timestamp,
+            channel: ch,
+            sender,
+            hidden: m.hidden || false,
+          };
+          if (m.role === "assistant" && m.text) {
+            const parts = m.text.split(/\n\n+/).map((p: string) => p.trim()).filter(Boolean);
+            if (parts.length > 1) {
+              parts.forEach((part: string, i: number) => {
+                historyMessages.push({
+                  ...base,
+                  id: nextId(),
+                  text: part,
+                  thinking: i === 0 ? m.thinking : undefined,
+                  toolCalls: i === 0 ? m.tool_calls : undefined,
+                });
+              });
+              continue;
+            }
+          }
+          historyMessages.push({ ...base, id: nextId(), text: m.text, thinking: m.thinking, toolCalls: m.tool_calls });
+        }
         updateChannel(ch, () => historyMessages);
+        setLoadingChannels((prev) => ({ ...prev, [ch]: false }));
         break;
       }
       case "log": {
@@ -269,6 +391,17 @@ export function useChat() {
         setGroupAutoStatus((prev) => prev ? { ...prev, active: false, reason: "paused" } : null);
         break;
       }
+      case "session_alert": {
+        const sa = msg as { alert: string; message: string; channel?: string; timestamp?: string };
+        setSessionAlerts((prev) => [...prev, {
+          id: `alert-${Date.now()}`,
+          alert: sa.alert,
+          message: sa.message,
+          channel: sa.channel,
+          timestamp: new Date().toISOString(),
+        }]);
+        break;
+      }
       case "error": {
         const ch = (msg as { channel?: Channel }).channel || "xiaoyu";
         updateChannel(ch, (prev) => {
@@ -284,12 +417,65 @@ export function useChat() {
         setStreaming(ch, false);
         break;
       }
+      case "hide_result": {
+        const hr = msg as { success: boolean; channel: Channel; hidden_timestamps: string[] };
+        if (hr.success && hr.hidden_timestamps?.length) {
+          const ch = hr.channel || "xiaoyu";
+          setHiddenTimestamps((prev) => {
+            const next = { ...prev };
+            next[ch] = new Set([...prev[ch], ...hr.hidden_timestamps]);
+            return next;
+          });
+          updateChannel(ch, (prev) =>
+            prev.map((m) => hr.hidden_timestamps.includes(m.timestamp) ? { ...m, hidden: true } : m)
+          );
+        }
+        break;
+      }
+      case "unhide_result": {
+        const ur = msg as { success: boolean; channel: Channel; unhidden_timestamps: string[] };
+        if (ur.success && ur.unhidden_timestamps?.length) {
+          const ch = ur.channel || "xiaoyu";
+          setHiddenTimestamps((prev) => {
+            const next = { ...prev };
+            const s = new Set(prev[ch]);
+            for (const ts of ur.unhidden_timestamps) s.delete(ts);
+            next[ch] = s;
+            return next;
+          });
+          updateChannel(ch, (prev) =>
+            prev.map((m) => ur.unhidden_timestamps.includes(m.timestamp) ? { ...m, hidden: false } : m)
+          );
+        }
+        break;
+      }
+      case "context_reloading": {
+        const ch = (msg as { channel: Channel }).channel || "xiaoyu";
+        setContextReloading((prev) => ({ ...prev, [ch]: true }));
+        break;
+      }
+      case "context_reloaded": {
+        const ch = (msg as { channel: Channel }).channel || "xiaoyu";
+        setContextReloading((prev) => ({ ...prev, [ch]: false }));
+        break;
+      }
     }
   }, []);
 
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    saveMessages(channelMessages);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => saveMessages(channelMessages), 1000);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [channelMessages]);
 
-  return { channelMessages, streamingChannels, status, groupAutoStatus, logs, weather, cityResults, sendUserMessage, handleWsMessage };
+  const setChannelLoading = useCallback((ch: Channel, val: boolean) => {
+    setLoadingChannels((prev) => ({ ...prev, [ch]: val }));
+  }, []);
+
+  const dismissAlert = useCallback((id: string) => {
+    setSessionAlerts((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  return { channelMessages, streamingChannels, loadingChannels, status, groupAutoStatus, logs, weather, cityResults, sessionAlerts, hiddenTimestamps, contextReloading, sendUserMessage, handleWsMessage, setChannelLoading, dismissAlert };
 }

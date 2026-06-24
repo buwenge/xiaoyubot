@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.jsonl
 sonnet_work_log.md
+notes/
+emotion_journal.db
+hidden_archive/
 
 # frontend
 xiaoyu-web/.env.local

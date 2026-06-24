@@ -70,13 +70,6 @@ export function StatusPanel({ status, onRefresh }: StatusPanelProps) {
   const totalInput = status.total_input || 0;
   const threshold = status.forge_threshold || 180000;
   const sonnetInput = status.sonnet_total_input || 0;
-  const cost = status.cost_session_total || 0;
-  const nextWake = status.next_wake
-    ? new Date(status.next_wake).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
-    : "--:--";
-  const nextWakeDelta = status.next_wake
-    ? Math.max(0, Math.round((new Date(status.next_wake).getTime() - Date.now()) / 60000))
-    : null;
 
   return (
     <div className="p-5 space-y-6 text-sm">
@@ -104,22 +97,6 @@ export function StatusPanel({ status, onRefresh }: StatusPanelProps) {
         max={200000}
         sessionId={status.sonnet_session_id}
       />
-
-      <div className="pt-2 border-t border-warm-border/20 space-y-3">
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-warm-text-secondary/50 font-light">累计费用</span>
-          <span className="text-warm-text tabular-nums">${cost.toFixed(2)}</span>
-        </div>
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-warm-text-secondary/50 font-light">下次唤醒</span>
-          <span className="text-warm-text">
-            {nextWake}
-            {nextWakeDelta !== null && (
-              <span className="text-warm-text-secondary/40 text-xs ml-1">({nextWakeDelta}m)</span>
-            )}
-          </span>
-        </div>
-      </div>
     </div>
   );
 }
