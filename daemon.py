@@ -390,7 +390,7 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 # ── Supabase (for DeepSeek tools) ────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://gmzulatcluypzagitgur.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 DEEPSEEK_SYSTEM_PROMPT_TEMPLATE = """你是 DeepSeek，群聊里的数据助手。你的职责是帮忙查数据、跑简单任务，把结论用简洁的中文回复。
